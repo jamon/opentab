@@ -34,6 +34,102 @@ def test_pi_store_ended_at_reflects_the_latest_assistant_reply():
         assert w.ended_at == iso_to_local("2026-05-15T07:40:00.000Z")
 
 
+def test_pi_store_prefers_the_latest_persisted_session_name_over_the_first_prompt():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "sessions")
+        cwd = os.path.join(tmp, "repo")
+        os.makedirs(cwd)
+        rows = [
+            _pi_session(PI_SID, cwd),
+            _pi_user("first prompt"),
+            _pi_assistant("model-x", 100, 50, cost=0.01),
+            {
+                "type": "session_info",
+                "timestamp": "2026-05-15T07:40:00.000Z",
+                "name": "Initial name",
+            },
+            {
+                "type": "session_info",
+                "timestamp": "2026-05-15T07:41:00.000Z",
+                "name": "Renamed session",
+            },
+        ]
+        _pi_write(root, "--proj--", PI_SID, rows)
+
+        workflow = ot.PiStore(root, _pi_args()).workflows()[0]
+
+        assert workflow.title == "Renamed session"
+
+
+def test_pi_store_falls_back_to_first_prompt_when_session_name_is_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "sessions")
+        cwd = os.path.join(tmp, "repo")
+        os.makedirs(cwd)
+        rows = [
+            _pi_session(PI_SID, cwd),
+            _pi_user("first prompt"),
+            _pi_assistant("model-x", 100, 50, cost=0.01),
+            {"type": "session_info", "name": "   "},
+        ]
+        _pi_write(root, "--proj--", PI_SID, rows)
+
+        workflow = ot.PiStore(root, _pi_args()).workflows()[0]
+
+        assert workflow.title == "first prompt"
+
+
+def test_pi_store_folds_pi_subagent_session_jsonl_and_ignores_runner_mirror():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "sessions")
+        cwd = os.path.join(tmp, "repo")
+        os.makedirs(cwd)
+        prefix = "2026-05-15T07-32-15-949Z"
+        child_sid = "019fa4fd-aaaa-7000-a6e9-c9e0c7ce25fc"
+        parent_rows = [
+            _pi_session(PI_SID, cwd),
+            _pi_user("parent task"),
+            _pi_assistant("parent-model", 100, 50, cost=0.01, mid="parent-a"),
+        ]
+        _pi_write(root, "--proj--", PI_SID, parent_rows, ts_prefix=prefix)
+        child_rows = [
+            _pi_session(child_sid, cwd),
+            {"type": "session_info", "name": "subagent-worker-run-1"},
+            _pi_user("child task", mid="child-u"),
+            _pi_assistant("qwen3.8:27b", 200, 20, cost=0.02, mid="child-a"),
+        ]
+        child_path = os.path.join(
+            root, "--proj--", f"{prefix}_{PI_SID}", "run-id", "run-0", "session.jsonl"
+        )
+        os.makedirs(os.path.dirname(child_path))
+        with open(child_path, "w", encoding="utf-8") as fh:
+            for row in child_rows:
+                fh.write(json.dumps(row) + "\n")
+        # The runner mirror repeats the child's calls but is not an accounting transcript.
+        artifact = os.path.join(root, "--proj--", "subagent-artifacts", "worker_transcript.jsonl")
+        os.makedirs(os.path.dirname(artifact))
+        with open(artifact, "w", encoding="utf-8") as fh:
+            for row in child_rows:
+                fh.write(json.dumps(row) + "\n")
+
+        store = ot.PiStore(root, _pi_args())
+        workflows = store.workflows()
+
+        assert len(workflows) == 1
+        workflow = workflows[0]
+        assert workflow.id == PI_SID and workflow.subagents == 1
+        assert workflow.root_cost == 0.01 and workflow.total_cost == 0.03
+        assert workflow.total_tokens == 370
+        assert {row["model_name"] for row in store.model_breakdown()} == {
+            "parent-model",
+            "qwen3.8:27b",
+        }
+        nodes = store.workflow_nodes(PI_SID)
+        assert [(node["id"], node["depth"]) for node in nodes] == [(PI_SID, 0), (child_sid, 1)]
+        assert nodes[1]["title"] == "subagent-worker-run-1"
+        assert store.root_of(child_sid) == PI_SID
+
+
 def test_pi_store_meters_cost_splits_cache_and_rolls_up_to_git_root():
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, "sessions")

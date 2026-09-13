@@ -153,7 +153,14 @@ class PiStore:
             "ts_max": None,
             "ts_meta": None,  # the `session` record's timestamp, preferred for created_at
             "title_prompt": None,
+            "title_name": None,
+            "title_name_ts": None,
             "models": {},
+            "parent_paths": set(),
+            "parent_id": None,
+            "children": [],
+            "is_child": False,
+            "agent": None,
             "seen_msgs": set(),  # assistant ids already counted (resume/fork dedup)
             "turns": [],  # one per assistant message, for the Turns tab
             "prompts": [],  # user messages, for the Turns tab's ▸ grouping
@@ -172,7 +179,14 @@ class PiStore:
         return self._files() + self._auth_paths()
 
     def _files(self) -> list[str]:
-        return glob.glob(os.path.join(self.root_dir, "**", "*.jsonl"), recursive=True)
+        # pi-subagents mirrors each child into subagent-artifacts for its runner. The
+        # child's own session.jsonl is the accounting source; reading both duplicates
+        # every call. Artifact JSONL is therefore deliberately outside this backend.
+        return [
+            path
+            for path in glob.glob(os.path.join(self.root_dir, "**", "*.jsonl"), recursive=True)
+            if "subagent-artifacts" not in os.path.normpath(path).split(os.sep)
+        ]
 
     def _session_files(self, session_id: str) -> list[str]:
         # A session's file is <timestamp>_<uuid>.jsonl; a resumed session leaves
@@ -236,27 +250,26 @@ class PiStore:
         return rows
 
     def root_of(self, session_id: str) -> str | None:
-        # A pi session id is already its root (no subagent tree), so this only
-        # confirms a file carries the id -- the cheap membership answer the
-        # --status backend probe relies on.
-        return session_id if self._session_files(session_id) else None
+        sessions = self._parse()
+        session = sessions.get(session_id)
+        if not session:
+            return None
+        seen = set()
+        while session["parent_id"] and session["parent_id"] not in seen:
+            seen.add(session_id)
+            session_id = session["parent_id"]
+            session = sessions.get(session_id)
+            if not session:
+                return None
+        return session_id
 
     def status_nodes(self, workflow_id: str) -> list[dict]:
         # workflow_nodes for the --status one-shot: the identical row, but off a
         # parse of just this session's own file(s) when nothing is loaded yet --
         # a status poll must never trigger the full-tree parse.
-        if self._sessions is not None:
-            return self.workflow_nodes(workflow_id)
-        sessions: dict[str, dict] = {}
-        for path, text in read_files_parallel(self._session_files(workflow_id)):
-            self._parse_file(path, text.split("\n"), sessions)
-        s = sessions.get(workflow_id)
-        if not s:
-            return []
-        self._finalize(workflow_id, s)
-        if not s["model_rows"]:
-            return []
-        return self._nodes_from(workflow_id, s)
+        sessions = self._parse()
+        root = self.root_of(workflow_id)
+        return self._nodes_from(root, sessions[root]) if root and root in sessions else []
 
     @property
     def records_cost(self) -> bool:
@@ -308,18 +321,78 @@ class PiStore:
             self._parse_file(path, text.split("\n"), sessions)
         for sid, s in sessions.items():
             self._finalize(sid, s)
-        # Drop sessions with no recorded usage (a stub with only session/model_change rows).
-        self._sessions = {sid: s for sid, s in sessions.items() if s["model_rows"]}
+        self._resolve_parents(sessions)
+        # Drop usage-less stubs only after resolving parentage, otherwise a child of a
+        # delegating-only parent becomes an unrelated root.
+        kept = {sid: s for sid, s in sessions.items() if s["model_rows"]}
+        for s in kept.values():
+            parent, seen = s["parent_id"], set()
+            while parent is not None and parent not in kept and parent not in seen:
+                seen.add(parent)
+                parent = sessions.get(parent, {}).get("parent_id")
+            s["parent_id"] = parent if parent in kept else None
+        self._link_subagents(kept)
+        self._sessions = kept
         return self._sessions
 
     def _parse_file(self, path: str, lines: list[str], sessions: dict[str, dict]) -> None:
         sid = self._id_from_name(path)
+        child = sid is None and os.path.basename(path) == "session.jsonl"
+        if child:
+            sid = self._first_session_id(lines)
         if not sid:
             return
         s = sessions.setdefault(sid, self._new_session())
         s["sid"] = sid
         s["paths"].append(path)
+        if child:
+            s["parent_paths"].add(self._parent_path(path))
+            s["agent"] = "subagent"
         self._parse_lines(s, lines, os.path.basename(path))
+
+    @staticmethod
+    def _first_session_id(lines: list[str]) -> str | None:
+        for line in lines:
+            if '"type"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "session":
+                session_id = record.get("id")
+                if isinstance(session_id, str) and session_id:
+                    return session_id
+        return None
+
+    @staticmethod
+    def _parent_path(path: str) -> str:
+        # pi-subagents stores a child at
+        # <parent-transcript-without-.jsonl>/<run-id>/run-N/session.jsonl.
+        # Walk out until the corresponding sibling transcript exists.
+        directory = os.path.dirname(path)
+        for _ in range(8):
+            candidate = directory + ".jsonl"
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+        return ""
+
+    @staticmethod
+    def _resolve_parents(sessions: dict[str, dict]) -> None:
+        by_path = {path: sid for sid, s in sessions.items() for path in s["paths"]}
+        for sid, s in sessions.items():
+            s["parent_id"] = next(
+                (
+                    parent
+                    for parent in (by_path.get(path) for path in sorted(s["parent_paths"]))
+                    if parent and parent != sid
+                ),
+                None,
+            )
 
     @staticmethod
     def _content_key(s: dict, prefix: str, ordinal: int, mid) -> str:
@@ -380,12 +453,98 @@ class PiStore:
                 s["seen_msgs"].add(mid)
             self._apply_usage(s, msg, ts, self._content_key(s, key_prefix, ordinal, mid))
 
+    def _link_subagents(self, sessions: dict[str, dict]) -> None:
+        for s in sessions.values():
+            s["children"] = []
+            s["is_child"] = False
+        for sid, s in sessions.items():
+            parent = s["parent_id"]
+            if parent and parent in sessions and parent != sid:
+                sessions[parent]["children"].append(sid)
+                s["is_child"] = True
+        for sid, s in sessions.items():
+            if not s["is_child"] and s["children"]:
+                self._fold_subagent_rows(sid, s, sessions)
+
+    @staticmethod
+    def _descendants(sessions: dict[str, dict], sid: str) -> list[tuple[str, int]]:
+        out, queue, seen = [], [(sid, 0)], {sid}
+        while queue:
+            current, depth = queue.pop(0)
+            for child in sessions[current]["children"]:
+                if child not in seen:
+                    seen.add(child)
+                    out.append((child, depth + 1))
+                    queue.append((child, depth + 1))
+        return out
+
+    def _fold_subagent_rows(self, sid: str, s: dict, sessions: dict[str, dict]) -> None:
+        total, own = {}, {}
+
+        def add(bucket: dict, model: str, acc: dict) -> None:
+            target = bucket.setdefault(model, self._new_acc())
+            for key in target:
+                target[key] += acc[key]
+
+        for model, acc in s["models"].items():
+            add(total, model, acc)
+            add(own, model, acc)
+        for child, _depth in self._descendants(sessions, sid):
+            for model, acc in sessions[child]["models"].items():
+                add(total, model, acc)
+        s["models_total"] = total
+        s["root_models"] = own
+        s["total_cost"] = round(sum(acc["cost"] for acc in total.values()), 6)
+        s["root_cost"] = round(sum(acc["cost"] for acc in own.values()), 6)
+        s["total_tokens"] = sum(acc["tokens_total"] for acc in total.values())
+        s["unpriced_tokens"] = sum(
+            acc["u_input"] + acc["u_output"] + acc["u_cache_read"] + acc["u_cache_write"]
+            for acc in total.values()
+        )
+        s["model_rows"] = self._model_rows(sid, total, own)
+
+    def _model_rows(self, sid: str, total: dict, own: dict) -> list[dict]:
+        rows = []
+        for model, acc in total.items():
+            root = own.get(model, self._new_acc())
+            rows.append(
+                {
+                    "root_id": sid,
+                    "model_name": model,
+                    "runs": acc["runs"],
+                    "cost": round(acc["cost"], 6),
+                    "root_cost": round(root["cost"], 6),
+                    "tokens_total": acc["tokens_total"],
+                    "input": acc["input"],
+                    "reasoning": 0,
+                    "cache_read": acc["cache_read"],
+                    "cache_write": acc["cache_write"],
+                    "output": acc["output"],
+                    "unpriced_input": acc["u_input"],
+                    "unpriced_reasoning": 0,
+                    "unpriced_cache_read": acc["u_cache_read"],
+                    "unpriced_cache_write": acc["u_cache_write"],
+                    "unpriced_output": acc["u_output"],
+                    "root_unpriced_input": root["u_input"],
+                    "root_unpriced_reasoning": 0,
+                    "root_unpriced_cache_read": root["u_cache_read"],
+                    "root_unpriced_cache_write": root["u_cache_write"],
+                    "root_unpriced_output": root["u_output"],
+                }
+            )
+        return rows
+
     def _extra_record(self, typ: str, o: dict, s: dict) -> None:
-        # Hook for a subclass that reacts to a record type PiStore itself has
-        # nothing to do with (e.g. omp's dedicated title/title_change records,
-        # or its own `session` record's title). A no-op here, so pi's own parse
-        # is unchanged.
-        pass
+        # Pi persists an explicit display name in session_info records. A resumed
+        # session can have multiple files, so retain the newest named value instead
+        # of letting parse order decide the title.
+        if typ != "session_info" or not isinstance(o.get("name"), str):
+            return
+        timestamp = o.get("timestamp")
+        previous = s["title_name_ts"]
+        if previous is None or (isinstance(timestamp, str) and timestamp >= previous):
+            s["title_name"] = o["name"].strip()
+            s["title_name_ts"] = timestamp if isinstance(timestamp, str) else previous
 
     def _model_label(self, msg: dict) -> str:
         # pi records models already provider-qualified (e.g. "moonshotai/kimi-k2.6"),
@@ -600,7 +759,7 @@ class PiStore:
         return bool(self._trace_sessions(workflow_id))
 
     def _finalize(self, sid: str, s: dict) -> None:
-        s["title"] = s["title_prompt"] or "(untitled)"
+        s["title"] = s["title_name"] or s["title_prompt"] or "(untitled)"
         s["directory"] = self._git_root(s["cwd"]) if s["cwd"] else "(unknown)"
         stamp = s["ts_meta"] or s["ts_min"]
         s["created_at"] = iso_to_local(stamp) if stamp else ""
@@ -695,15 +854,17 @@ class PiStore:
         sessions = self._parse()
         rows = []
         for sid, s in sessions.items():
+            if s["is_child"]:
+                continue
             rows.append(
                 Workflow(
                     id=sid,
                     title=s["title"],
                     directory=s["directory"],
                     created_at=s["created_at"],
-                    root_cost=s["total_cost"],  # flat: root == total
+                    root_cost=s.get("root_cost", s["total_cost"]),
                     total_cost=s["total_cost"],
-                    subagents=0,  # pi has no subagent tree
+                    subagents=len(self._descendants(sessions, sid)),
                     model_count=0,  # filled by App._load_model_cache
                     total_tokens=s["total_tokens"],
                     unpriced_tokens=s["unpriced_tokens"],
@@ -735,7 +896,8 @@ class PiStore:
     def model_breakdown(self) -> list[dict]:
         out: list[dict] = []
         for s in self._parse().values():
-            out.extend(s["model_rows"])
+            if not s["is_child"]:
+                out.extend(s["model_rows"])
         return out
 
     def workflow_nodes(self, workflow_id: str) -> list[dict]:
@@ -745,20 +907,29 @@ class PiStore:
         return self._nodes_from(workflow_id, s)
 
     def _nodes_from(self, workflow_id: str, s: dict) -> list[dict]:
-        root = self._new_acc()
-        best, best_runs = "unknown (not recorded)", -1
-        for model_name, acc in s["models"].items():
-            for k in root:
-                root[k] += acc[k]
-            if acc["runs"] > best_runs:
-                best_runs, best = acc["runs"], model_name
-        # Single depth-0 node; cost is the recorded total. _priced_nodes reprices a $0
-        # node from its token columns under "$".
-        nodes = [
-            self._node(
-                workflow_id, 0, "-", s["title"], s["created_at"], best, s["total_cost"], root
+        sessions = self._parse()
+        nodes = []
+        for node_id, depth in [(workflow_id, 0), *self._descendants(sessions, workflow_id)]:
+            node = sessions[node_id]
+            best, best_runs = "unknown (not recorded)", -1
+            acc_total = self._new_acc()
+            for model_name, acc in node["models"].items():
+                for key in acc_total:
+                    acc_total[key] += acc[key]
+                if acc["runs"] > best_runs:
+                    best_runs, best = acc["runs"], model_name
+            nodes.append(
+                self._node(
+                    node_id,
+                    depth,
+                    "-" if depth == 0 else node.get("agent") or "subagent",
+                    node["title"],
+                    node["created_at"],
+                    best,
+                    node["total_cost"],
+                    acc_total,
+                )
             )
-        ]
         if self.demo:
             nodes = [self._demo_node(n) for n in nodes]
         return nodes
